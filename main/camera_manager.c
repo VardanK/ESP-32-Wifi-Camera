@@ -38,6 +38,7 @@ static camera_internal_state_t s_camera_state = CAMERA_STATE_UNINITIALIZED;
 static esp_err_t s_camera_last_err = ESP_OK;
 static char s_camera_message[160] = "Camera not initialized.";
 static bool s_camera_low_mem_mode = false;
+static bool s_camera_psram_detected = false;
 static framesize_t s_camera_framesize = FRAMESIZE_INVALID;
 static uint64_t s_last_frame_timestamp_us = 0;
 static bool s_discard_next_frame = true;
@@ -53,6 +54,7 @@ static uint16_t s_last_frame_height = 0;
 static void camera_manager_set_ready(const char *message);
 static void camera_manager_set_error(esp_err_t err, const char *message);
 static void camera_manager_set_ready_with_flash_info(const char *base_message);
+static const char *camera_manager_base_ready_message(void);
 static esp_err_t camera_apply_default_settings(void);
 static size_t camera_manager_escape_json(const char *input, char *output, size_t output_len);
 static esp_err_t camera_manager_send_error_response(httpd_req_t *req);
@@ -97,6 +99,7 @@ esp_err_t camera_manager_init(void) {
 
     size_t psram_bytes = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
     bool psram_available = psram_bytes > 0;
+    s_camera_psram_detected = psram_available;
 
     bool low_mem_mode = false;
 
@@ -141,9 +144,7 @@ esp_err_t camera_manager_init(void) {
         return err;
     }
 
-    const char *ready_message = s_camera_low_mem_mode
-                                    ? "Camera ready. PSRAM fallback active; high resolutions above VGA are disabled."
-                                    : "Camera ready.";
+    const char *ready_message = camera_manager_base_ready_message();
     camera_manager_set_ready_with_flash_info(ready_message);
     return ESP_OK;
 }
@@ -486,11 +487,14 @@ esp_err_t camera_manager_control(const char *var, int value) {
     }
 
     s_discard_next_frame = true;
-    const char *ready_msg = (framesize_clamped && s_camera_low_mem_mode)
-                                ? "Camera ready. Requested resolution reduced due to memory limits."
-                                : (s_camera_low_mem_mode
-                                       ? "Camera ready. PSRAM fallback active; high resolutions above VGA are disabled."
-                                       : "Camera ready.");
+    const char *ready_msg = NULL;
+    if (framesize_clamped && s_camera_low_mem_mode) {
+        ready_msg = "Camera ready. Requested resolution reduced due to memory limits.";
+    } else if (framesize_clamped) {
+        ready_msg = "Camera ready. Requested resolution adjusted to supported range.";
+    } else {
+        ready_msg = camera_manager_base_ready_message();
+    }
     camera_manager_set_ready_with_flash_info(ready_msg);
     return ESP_OK;
 }
@@ -515,6 +519,16 @@ static void camera_manager_set_error(esp_err_t err, const char *message) {
     } else {
         snprintf(s_camera_message, sizeof(s_camera_message), "Camera error: %s", esp_err_to_name(err));
     }
+}
+
+static const char *camera_manager_base_ready_message(void) {
+    if (!s_camera_psram_detected) {
+        return "Camera ready. PSRAM not detected; high resolutions above VGA are disabled.";
+    }
+    if (s_camera_low_mem_mode) {
+        return "Camera ready. PSRAM detected but running in reduced-memory mode; high resolutions may be limited.";
+    }
+    return "Camera ready. PSRAM detected; high resolutions above VGA are available.";
 }
 
 static void camera_manager_set_ready_with_flash_info(const char *base_message) {
@@ -555,6 +569,10 @@ const char *camera_manager_status_message(void) {
 
 bool camera_manager_is_low_mem_mode(void) {
     return s_camera_low_mem_mode;
+}
+
+bool camera_manager_psram_detected(void) {
+    return s_camera_psram_detected;
 }
 
 framesize_t camera_manager_current_framesize(void) {
@@ -626,9 +644,7 @@ esp_err_t camera_manager_set_flash_brightness(int percent) {
     }
 
     s_discard_next_frame = true;
-    const char *base = s_camera_low_mem_mode
-                           ? "Camera ready. PSRAM fallback active; high resolutions above VGA are disabled."
-                           : "Camera ready.";
+    const char *base = camera_manager_base_ready_message();
     camera_manager_set_ready_with_flash_info(base);
     ESP_LOGI(CAMERA_MANAGER_TAG, "Flashlight brightness set to %d%%", clamped);
     return ESP_OK;
@@ -651,9 +667,7 @@ esp_err_t camera_manager_set_flash_enabled(bool enabled) {
     }
 
     s_discard_next_frame = true;
-    const char *base = s_camera_low_mem_mode
-                           ? "Camera ready. PSRAM fallback active; high resolutions above VGA are disabled."
-                           : "Camera ready.";
+    const char *base = camera_manager_base_ready_message();
     camera_manager_set_ready_with_flash_info(base);
     ESP_LOGI(CAMERA_MANAGER_TAG, "Flashlight %s", s_flash_enabled ? "enabled" : "disabled");
     return ESP_OK;

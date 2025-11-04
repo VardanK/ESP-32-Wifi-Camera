@@ -543,7 +543,15 @@ static const char DASHBOARD_HTML[] =
                 "}else{"
                     "messages.push('WiFi connected.');"
                 "}"
-                "if(data.camera_message){messages.push(data.camera_message);}" 
+                "const cameraMessageText=typeof data.camera_message==='string'?data.camera_message:'';"
+                "if(cameraMessageText){messages.push(cameraMessageText);}" 
+                "const cameraMessageMentionsPsram=cameraMessageText.toLowerCase().includes('psram');"
+                "if(!cameraMessageMentionsPsram){"
+                    "if(data.camera_psram_detected===false){messages.push('PSRAM not detected; high resolutions above VGA are disabled.');}"
+                    "else if(data.camera_psram_detected===true&&data.camera_low_mem){messages.push('PSRAM detected but running in reduced-memory mode.');}"
+                    "else if(data.camera_psram_detected===true){messages.push('PSRAM detected.');}"
+                    "else if(data.camera_low_mem){messages.push('Running in reduced-memory mode.');}"
+                "}"
                 "if(data.camera_frame_width&&data.camera_frame_height){messages.push(`Frame ${data.camera_frame_width}x${data.camera_frame_height}`);}" 
                 "if(data.camera_flash_supported===false){messages.push('Flashlight not supported on this device.');}" 
                 "else if(data.camera_flash_enabled){"
@@ -1008,6 +1016,7 @@ static esp_err_t handle_status(httpd_req_t *req) {
 
     const char *mode = provisioning ? "provisioning" : (connected ? "station" : "connecting");
     bool camera_low_mem = camera_manager_is_low_mem_mode();
+    bool camera_psram_detected = camera_manager_psram_detected();
     framesize_t camera_framesize = camera_manager_current_framesize();
     uint16_t camera_frame_width = 0;
     uint16_t camera_frame_height = 0;
@@ -1020,7 +1029,7 @@ static esp_err_t handle_status(httpd_req_t *req) {
     snprintf(
         response,
         sizeof(response),
-        "{\"connected\":%s,\"mode\":\"%s\",\"ssid\":\"%s\",\"rssi\":%d,\"ip\":\"%s\",\"restart_in_ms\":%d,\"restart_pending\":%s,\"factory_reset_pending\":%s,\"camera_ready\":%s,\"camera_initialized\":%s,\"camera_error_code\":%d,\"camera_message\":\"%s\",\"camera_low_mem\":%s,\"camera_framesize\":%d,\"camera_frame_width\":%u,\"camera_frame_height\":%u,\"camera_flash_supported\":%s,\"camera_flash_enabled\":%s,\"camera_flash_brightness\":%d,\"sta_connecting\":%s,\"sta_retry_count\":%d,\"sta_reason\":%d,\"sta_reason_message\":\"%s\"}",
+        "{\"connected\":%s,\"mode\":\"%s\",\"ssid\":\"%s\",\"rssi\":%d,\"ip\":\"%s\",\"restart_in_ms\":%d,\"restart_pending\":%s,\"factory_reset_pending\":%s,\"camera_ready\":%s,\"camera_initialized\":%s,\"camera_error_code\":%d,\"camera_message\":\"%s\",\"camera_low_mem\":%s,\"camera_psram_detected\":%s,\"camera_framesize\":%d,\"camera_frame_width\":%u,\"camera_frame_height\":%u,\"camera_flash_supported\":%s,\"camera_flash_enabled\":%s,\"camera_flash_brightness\":%d,\"sta_connecting\":%s,\"sta_retry_count\":%d,\"sta_reason\":%d,\"sta_reason_message\":\"%s\"}",
         connected ? "true" : "false",
         mode,
         escaped_ssid,
@@ -1034,6 +1043,7 @@ static esp_err_t handle_status(httpd_req_t *req) {
         (int)camera_error,
         camera_message_escaped,
         camera_low_mem ? "true" : "false",
+        camera_psram_detected ? "true" : "false",
         (int)camera_framesize,
         (unsigned int)camera_frame_width,
         (unsigned int)camera_frame_height,
