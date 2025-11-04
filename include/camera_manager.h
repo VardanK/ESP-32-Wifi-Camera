@@ -14,6 +14,7 @@ bool camera_manager_is_ready(void);
 esp_err_t camera_manager_last_error(void);
 const char *camera_manager_status_message(void);
 bool camera_manager_is_low_mem_mode(void);
+bool camera_manager_psram_detected(void);
 framesize_t camera_manager_current_framesize(void);
 void camera_manager_get_frame_dimensions(uint16_t *width, uint16_t *height);
 esp_err_t camera_manager_set_flash_enabled(bool enabled);

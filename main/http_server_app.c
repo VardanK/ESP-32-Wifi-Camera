@@ -361,10 +361,10 @@ static const char DASHBOARD_HTML[] =
     "<h1>WiFi Camera Dashboard</h1>"
     "<section class=\"card\">"
     "<h2>Capture</h2>"
+    "<img id=\"snapshot\" alt=\"Camera snapshot\" />"
     "<div class=\"actions\">"
     "<button id=\"capture\">Capture Photo</button>"
     "</div>"
-    "<img id=\"snapshot\" alt=\"Camera snapshot\" />"
     "</section>"
     "<section class=\"card\">"
     "<h2>Diagnostics</h2>"
@@ -543,7 +543,15 @@ static const char DASHBOARD_HTML[] =
                 "}else{"
                     "messages.push('WiFi connected.');"
                 "}"
-                "if(data.camera_message){messages.push(data.camera_message);}" 
+                "const cameraMessageText=typeof data.camera_message==='string'?data.camera_message:'';"
+                "if(cameraMessageText){messages.push(cameraMessageText);}" 
+                "const cameraMessageMentionsPsram=cameraMessageText.toLowerCase().includes('psram');"
+                "if(!cameraMessageMentionsPsram){"
+                    "if(data.camera_psram_detected===false){messages.push('PSRAM not detected; high resolutions above VGA are disabled.');}"
+                    "else if(data.camera_psram_detected===true&&data.camera_low_mem){messages.push('PSRAM detected but running in reduced-memory mode.');}"
+                    "else if(data.camera_psram_detected===true){messages.push('PSRAM detected.');}"
+                    "else if(data.camera_low_mem){messages.push('Running in reduced-memory mode.');}"
+                "}"
                 "if(data.camera_frame_width&&data.camera_frame_height){messages.push(`Frame ${data.camera_frame_width}x${data.camera_frame_height}`);}" 
                 "if(data.camera_flash_supported===false){messages.push('Flashlight not supported on this device.');}" 
                 "else if(data.camera_flash_enabled){"
@@ -936,6 +944,14 @@ static esp_err_t handle_config(httpd_req_t *req) {
     return httpd_resp_send(req, "{\"status\":\"ok\"}", HTTPD_RESP_USE_STRLEN);
 }
 
+/**
+ * Build and send a JSON status payload describing network connectivity, restart/factory-reset timers,
+ * and camera state (initialization, readiness, error code/message, framesize/dimensions, flash state),
+ * plus STA connection diagnostics.
+ *
+ * @param req HTTP request handle used to write headers and the JSON response body.
+ * @returns ESP_OK if the response was sent successfully; otherwise an error code returned by the HTTP server API. 
+ */
 static esp_err_t handle_status(httpd_req_t *req) {
     bool connected = wifi_manager_is_connected();
     bool provisioning = wifi_manager_is_provisioning();
@@ -1008,6 +1024,7 @@ static esp_err_t handle_status(httpd_req_t *req) {
 
     const char *mode = provisioning ? "provisioning" : (connected ? "station" : "connecting");
     bool camera_low_mem = camera_manager_is_low_mem_mode();
+    bool camera_psram_detected = camera_manager_psram_detected();
     framesize_t camera_framesize = camera_manager_current_framesize();
     uint16_t camera_frame_width = 0;
     uint16_t camera_frame_height = 0;
@@ -1020,7 +1037,7 @@ static esp_err_t handle_status(httpd_req_t *req) {
     snprintf(
         response,
         sizeof(response),
-        "{\"connected\":%s,\"mode\":\"%s\",\"ssid\":\"%s\",\"rssi\":%d,\"ip\":\"%s\",\"restart_in_ms\":%d,\"restart_pending\":%s,\"factory_reset_pending\":%s,\"camera_ready\":%s,\"camera_initialized\":%s,\"camera_error_code\":%d,\"camera_message\":\"%s\",\"camera_low_mem\":%s,\"camera_framesize\":%d,\"camera_frame_width\":%u,\"camera_frame_height\":%u,\"camera_flash_supported\":%s,\"camera_flash_enabled\":%s,\"camera_flash_brightness\":%d,\"sta_connecting\":%s,\"sta_retry_count\":%d,\"sta_reason\":%d,\"sta_reason_message\":\"%s\"}",
+        "{\"connected\":%s,\"mode\":\"%s\",\"ssid\":\"%s\",\"rssi\":%d,\"ip\":\"%s\",\"restart_in_ms\":%d,\"restart_pending\":%s,\"factory_reset_pending\":%s,\"camera_ready\":%s,\"camera_initialized\":%s,\"camera_error_code\":%d,\"camera_message\":\"%s\",\"camera_low_mem\":%s,\"camera_psram_detected\":%s,\"camera_framesize\":%d,\"camera_frame_width\":%u,\"camera_frame_height\":%u,\"camera_flash_supported\":%s,\"camera_flash_enabled\":%s,\"camera_flash_brightness\":%d,\"sta_connecting\":%s,\"sta_retry_count\":%d,\"sta_reason\":%d,\"sta_reason_message\":\"%s\"}",
         connected ? "true" : "false",
         mode,
         escaped_ssid,
@@ -1034,6 +1051,7 @@ static esp_err_t handle_status(httpd_req_t *req) {
         (int)camera_error,
         camera_message_escaped,
         camera_low_mem ? "true" : "false",
+        camera_psram_detected ? "true" : "false",
         (int)camera_framesize,
         (unsigned int)camera_frame_width,
         (unsigned int)camera_frame_height,
@@ -1579,6 +1597,16 @@ static void url_decode(char *str) {
     *dst = '\0';
 }
 
+/**
+ * Start the HTTP server and register built-in API endpoints if the server is not already running.
+ *
+ * This function initializes the HTTP server with the configured parameters, registers the
+ * application's URI handlers (root, scan, config, status, device status, capture, control,
+ * and factory reset), and ensures the restart countdown timer is created. The call is
+ * idempotent: if the server is already started, it returns immediately.
+ *
+ * @returns ESP_OK on success, or an esp_err_t error code if the server fails to start. 
+ */
 esp_err_t http_server_app_start(void) {
     if (s_http_handle) {
         return ESP_OK;
@@ -1588,6 +1616,8 @@ esp_err_t http_server_app_start(void) {
     config.stack_size = 10240;
     config.server_port = 80;
     config.uri_match_fn = httpd_uri_match_wildcard;
+    config.recv_wait_timeout = 15;
+    config.send_wait_timeout = 15;
 
     esp_err_t err = httpd_start(&s_http_handle, &config);
     if (err != ESP_OK) {

@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include "esp_camera.h"
+#include "sensor.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -13,6 +14,7 @@
 #include "freertos/task.h"
 
 #define CAMERA_MANAGER_TAG "camera_manager"
+#define CAMERA_MANAGER_CAPTURE_TIMEOUT_MS 15000
 
 static const int CAMERA_XCLK_FREQ = 20000000;
 #ifndef CAMERA_FLASH_GPIO
@@ -38,6 +40,7 @@ static camera_internal_state_t s_camera_state = CAMERA_STATE_UNINITIALIZED;
 static esp_err_t s_camera_last_err = ESP_OK;
 static char s_camera_message[160] = "Camera not initialized.";
 static bool s_camera_low_mem_mode = false;
+static bool s_camera_psram_detected = false;
 static framesize_t s_camera_framesize = FRAMESIZE_INVALID;
 static uint64_t s_last_frame_timestamp_us = 0;
 static bool s_discard_next_frame = true;
@@ -53,6 +56,7 @@ static uint16_t s_last_frame_height = 0;
 static void camera_manager_set_ready(const char *message);
 static void camera_manager_set_error(esp_err_t err, const char *message);
 static void camera_manager_set_ready_with_flash_info(const char *base_message);
+static const char *camera_manager_base_ready_message(void);
 static esp_err_t camera_apply_default_settings(void);
 static size_t camera_manager_escape_json(const char *input, char *output, size_t output_len);
 static esp_err_t camera_manager_send_error_response(httpd_req_t *req);
@@ -62,7 +66,22 @@ static void camera_flash_configure(void);
 static uint32_t camera_flash_target_duty(void);
 static bool camera_flash_should_emit(void);
 static bool camera_flash_set(bool on);
+static camera_fb_t *camera_manager_fb_get_with_timeout(TickType_t timeout_ticks);
 
+extern camera_fb_t *cam_take(TickType_t timeout);
+
+/**
+ * Initialize the camera subsystem, configure hardware and runtime state, and apply default sensor settings.
+ *
+ * Detects PSRAM and chooses an appropriate memory/profile, initializes the camera driver with
+ * a default configuration, configures flash hardware, applies default sensor parameters, and
+ * updates the module's internal state and ready/error status message.
+ *
+ * On failure the module state is set to ERROR with a descriptive message; on success the state
+ * is set to READY (including flash info if applicable).
+ *
+ * @returns ESP_OK on successful initialization; otherwise returns the esp_err_t error code from
+ *          the failing operation and records that error in the module state.
 esp_err_t camera_manager_init(void) {
     camera_config_t config = {
         .pin_pwdn = 32,
@@ -97,6 +116,7 @@ esp_err_t camera_manager_init(void) {
 
     size_t psram_bytes = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
     bool psram_available = psram_bytes > 0;
+    s_camera_psram_detected = psram_available;
 
     bool low_mem_mode = false;
 
@@ -141,9 +161,7 @@ esp_err_t camera_manager_init(void) {
         return err;
     }
 
-    const char *ready_message = s_camera_low_mem_mode
-                                    ? "Camera ready. PSRAM fallback active; high resolutions above VGA are disabled."
-                                    : "Camera ready.";
+    const char *ready_message = camera_manager_base_ready_message();
     camera_manager_set_ready_with_flash_info(ready_message);
     return ESP_OK;
 }
@@ -295,6 +313,16 @@ static void camera_flash_configure(void) {
 #endif
 }
 
+/**
+ * Capture a camera frame and send it as a JPEG in the provided HTTP request.
+ *
+ * If flash hardware is supported and enabled, the flash may be temporarily activated for the capture.
+ * Updates camera-manager runtime state (ready/error, last-frame timestamp and dimensions) and returns
+ * an appropriate ESP error code reflecting capture or transmission outcome.
+ *
+ * @param req HTTP request used to send the JPEG response (response headers and body).
+ * @returns `ESP_OK` if the frame was captured and transmitted successfully; otherwise an `esp_err_t`
+ *          error code describing the failure (e.g., timeout, transmission error). */
 esp_err_t camera_manager_capture(httpd_req_t *req) {
     bool flash_active = false;
 #if (CAMERA_FLASH_GPIO >= 0)
@@ -308,12 +336,13 @@ esp_err_t camera_manager_capture(httpd_req_t *req) {
     int frames_to_skip = s_discard_next_frame ? 2 : 1;
     s_discard_next_frame = false;
 
+    const TickType_t frame_timeout = pdMS_TO_TICKS(CAMERA_MANAGER_CAPTURE_TIMEOUT_MS);
     camera_fb_t *frame = NULL;
     for (int attempt = 0; attempt < 4; ++attempt) {
-        frame = esp_camera_fb_get();
+        frame = camera_manager_fb_get_with_timeout(frame_timeout);
         if (!frame) {
-            ESP_LOGE(CAMERA_MANAGER_TAG, "Failed to acquire camera frame");
-            camera_manager_set_error(ESP_FAIL, "Unable to capture an image. Ensure the camera module is seated correctly and sufficient lighting/power is available, then try again.");
+            ESP_LOGE(CAMERA_MANAGER_TAG, "Failed to acquire camera frame within %d ms", CAMERA_MANAGER_CAPTURE_TIMEOUT_MS);
+            camera_manager_set_error(ESP_ERR_TIMEOUT, "Image capture timed out. Ensure the camera module is seated correctly, sufficient lighting/power is available, and try again.");
             if (flash_active) {
                 camera_flash_set(false);
             }
@@ -374,6 +403,46 @@ esp_err_t camera_manager_capture(httpd_req_t *req) {
     return res;
 }
 
+/**
+ * Obtain a camera frame buffer within the specified FreeRTOS tick timeout and update its reported
+ * dimensions and pixel format from the active sensor when available.
+ *
+ * @param timeout_ticks Maximum number of FreeRTOS ticks to wait for a frame; if zero, a minimum
+ *                      wait of 1 tick is used.
+ * @returns Pointer to the acquired `camera_fb_t` on success, `NULL` on timeout or failure. On a
+ *          successful acquisition, the returned frame buffer's `width`, `height`, and `format`
+ *          fields may be updated to reflect the active sensor's current framesize and pixel
+ *          format when a sensor is present. */
+static camera_fb_t *camera_manager_fb_get_with_timeout(TickType_t timeout_ticks) {
+    if (timeout_ticks == 0) {
+        timeout_ticks = 1;
+    }
+
+    camera_fb_t *fb = cam_take(timeout_ticks);
+    if (!fb) {
+        return NULL;
+    }
+
+    sensor_t *sensor = esp_camera_sensor_get();
+    if (sensor) {
+        framesize_t active = sensor->status.framesize;
+        if (active >= FRAMESIZE_96X96 && active < FRAMESIZE_INVALID) {
+            fb->width = resolution[active].width;
+            fb->height = resolution[active].height;
+        }
+        fb->format = sensor->pixformat;
+    }
+
+    return fb;
+}
+
+/**
+ * Obtain the active camera sensor handle.
+ *
+ * Logs an error if the sensor handle cannot be retrieved.
+ *
+ * @returns Pointer to the active `sensor_t` handle, or `NULL` if no sensor is available.
+ */
 static sensor_t *camera_manager_sensor(void) {
     sensor_t *sensor = esp_camera_sensor_get();
     if (!sensor) {
@@ -412,6 +481,23 @@ static int clamp(int value, int min_value, int max_value) {
     return value;
 }
 
+/**
+ * Apply a named camera control or configuration change.
+ *
+ * @param var Null-terminated string naming the control to change. Supported keys include:
+ *            "flash", "flash_brightness", "framesize", "quality", "brightness",
+ *            "contrast", "saturation", "sharpness", "special_effect",
+ *            "awb", "aec", "agc", "hmirror", "vflip".
+ *            Behavior and accepted value ranges are key-dependent.
+ * @param value Integer value for the requested control (interpretation depends on `var`).
+ *
+ * @returns
+ * ESP_OK on success.
+ * ESP_ERR_INVALID_STATE if the camera sensor is unavailable.
+ * ESP_ERR_INVALID_ARG if `var` is not supported.
+ * ESP_FAIL if changing the framesize fails.
+ * May also return error codes propagated from flash/brightness setters (for example ESP_ERR_NOT_SUPPORTED).
+ */
 esp_err_t camera_manager_control(const char *var, int value) {
     sensor_t *sensor = camera_manager_sensor();
     if (!sensor || !var) {
@@ -486,11 +572,14 @@ esp_err_t camera_manager_control(const char *var, int value) {
     }
 
     s_discard_next_frame = true;
-    const char *ready_msg = (framesize_clamped && s_camera_low_mem_mode)
-                                ? "Camera ready. Requested resolution reduced due to memory limits."
-                                : (s_camera_low_mem_mode
-                                       ? "Camera ready. PSRAM fallback active; high resolutions above VGA are disabled."
-                                       : "Camera ready.");
+    const char *ready_msg = NULL;
+    if (framesize_clamped && s_camera_low_mem_mode) {
+        ready_msg = "Camera ready. Requested resolution reduced due to memory limits.";
+    } else if (framesize_clamped) {
+        ready_msg = "Camera ready. Requested resolution adjusted to supported range.";
+    } else {
+        ready_msg = camera_manager_base_ready_message();
+    }
     camera_manager_set_ready_with_flash_info(ready_msg);
     return ESP_OK;
 }
@@ -506,6 +595,14 @@ static void camera_manager_set_ready(const char *message) {
     }
 }
 
+/**
+ * Mark the camera manager as in an error state and update its last error and status message.
+ *
+ * @param err Error code to record as the camera's last error.
+ * @param message Optional human-readable message to store; if NULL or empty, a default message
+ *        of the form "Camera error: <ERR_NAME>" (where <ERR_NAME> is derived from esp_err_to_name)
+ *        will be written into the status buffer.
+ */
 static void camera_manager_set_error(esp_err_t err, const char *message) {
     s_camera_state = CAMERA_STATE_ERROR;
     s_camera_last_err = err;
@@ -517,6 +614,32 @@ static void camera_manager_set_error(esp_err_t err, const char *message) {
     }
 }
 
+/**
+ * Selects a base status message describing PSRAM presence and whether the camera is in reduced-memory mode.
+ * @returns The base status string:
+ * - `"Camera ready. PSRAM not detected; high resolutions above VGA are disabled."` when PSRAM is not detected.
+ * - `"Camera ready. PSRAM detected but running in reduced-memory mode; high resolutions may be limited."` when PSRAM is detected but the camera is in low-memory mode.
+ * - `"Camera ready. PSRAM detected; high resolutions above VGA are available."` otherwise.
+ */
+static const char *camera_manager_base_ready_message(void) {
+    if (!s_camera_psram_detected) {
+        return "Camera ready. PSRAM not detected; high resolutions above VGA are disabled.";
+    }
+    if (s_camera_low_mem_mode) {
+        return "Camera ready. PSRAM detected but running in reduced-memory mode; high resolutions may be limited.";
+    }
+    return "Camera ready. PSRAM detected; high resolutions above VGA are available.";
+}
+
+/**
+ * Update the module ready message to include current flashlight status.
+ *
+ * If `base_message` is NULL, "Camera ready." is used as the base. When the flashlight
+ * is enabled the ready message is extended with either a fixed-brightness note or
+ * the current LEDC brightness percentage; otherwise the base message is used verbatim.
+ *
+ * @param base_message Optional base ready message to prepend to flash status.
+ */
 static void camera_manager_set_ready_with_flash_info(const char *base_message) {
     if (s_flash_enabled) {
         char message[sizeof(s_camera_message)] = {0};
@@ -553,10 +676,29 @@ const char *camera_manager_status_message(void) {
     return s_camera_message;
 }
 
+/**
+ * Report whether the camera is operating in a reduced-memory (low-memory) profile.
+ *
+ * @returns `true` if the camera is operating in low-memory mode, `false` otherwise.
+ */
 bool camera_manager_is_low_mem_mode(void) {
     return s_camera_low_mem_mode;
 }
 
+/**
+ * Indicates whether PSRAM was detected during camera initialization.
+ *
+ * @returns `true` if PSRAM was detected and available, `false` otherwise.
+ */
+bool camera_manager_psram_detected(void) {
+    return s_camera_psram_detected;
+}
+
+/**
+ * Get the configured camera frame size.
+ *
+ * @returns The current framesize_t value representing the configured camera frame size.
+ */
 framesize_t camera_manager_current_framesize(void) {
     return s_camera_framesize;
 }
@@ -605,6 +747,17 @@ int camera_manager_flash_brightness(void) {
     return (int)s_flash_brightness_percent;
 }
 
+/**
+ * Set the flashlight brightness percentage for LEDC-controlled flash.
+ *
+ * Updates the configured flash brightness (0–100%). If the flash is currently emitting, the new
+ * brightness is applied immediately. The function also marks that the next captured frame should
+ * be discarded and updates the manager's ready status message to include current flash info.
+ *
+ * @param percent Desired brightness percentage (0–100). Values outside this range will be clamped.
+ * @returns ESP_OK on success.
+ *          ESP_ERR_NOT_SUPPORTED if the hardware does not support LEDC-based flash control.
+ */
 esp_err_t camera_manager_set_flash_brightness(int percent) {
     if (!s_flash_supported || !s_flash_ledc) {
         ESP_LOGW(CAMERA_MANAGER_TAG, "Flashlight brightness requested but not supported on this hardware");
@@ -626,14 +779,22 @@ esp_err_t camera_manager_set_flash_brightness(int percent) {
     }
 
     s_discard_next_frame = true;
-    const char *base = s_camera_low_mem_mode
-                           ? "Camera ready. PSRAM fallback active; high resolutions above VGA are disabled."
-                           : "Camera ready.";
+    const char *base = camera_manager_base_ready_message();
     camera_manager_set_ready_with_flash_info(base);
     ESP_LOGI(CAMERA_MANAGER_TAG, "Flashlight brightness set to %d%%", clamped);
     return ESP_OK;
 }
 
+/**
+ * Enable or disable the camera's flash hardware.
+ *
+ * When called, updates the module's flash enable state. If disabling while the
+ * flash is currently emitting, the flash will be turned off. Marks the next
+ * captured frame to be discarded and updates the manager's ready/status message.
+ *
+ * @param enabled true to enable flash, false to disable it.
+ * @returns ESP_OK on success, ESP_ERR_NOT_SUPPORTED if enabling is requested but the hardware does not support flash.
+ */
 esp_err_t camera_manager_set_flash_enabled(bool enabled) {
     if (enabled && !s_flash_supported) {
         ESP_LOGW(CAMERA_MANAGER_TAG, "Flashlight requested but not supported on this hardware");
@@ -651,9 +812,7 @@ esp_err_t camera_manager_set_flash_enabled(bool enabled) {
     }
 
     s_discard_next_frame = true;
-    const char *base = s_camera_low_mem_mode
-                           ? "Camera ready. PSRAM fallback active; high resolutions above VGA are disabled."
-                           : "Camera ready.";
+    const char *base = camera_manager_base_ready_message();
     camera_manager_set_ready_with_flash_info(base);
     ESP_LOGI(CAMERA_MANAGER_TAG, "Flashlight %s", s_flash_enabled ? "enabled" : "disabled");
     return ESP_OK;
