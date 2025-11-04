@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include "esp_camera.h"
+#include "sensor.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -13,6 +14,7 @@
 #include "freertos/task.h"
 
 #define CAMERA_MANAGER_TAG "camera_manager"
+#define CAMERA_MANAGER_CAPTURE_TIMEOUT_MS 15000
 
 static const int CAMERA_XCLK_FREQ = 20000000;
 #ifndef CAMERA_FLASH_GPIO
@@ -64,6 +66,9 @@ static void camera_flash_configure(void);
 static uint32_t camera_flash_target_duty(void);
 static bool camera_flash_should_emit(void);
 static bool camera_flash_set(bool on);
+static camera_fb_t *camera_manager_fb_get_with_timeout(TickType_t timeout_ticks);
+
+extern camera_fb_t *cam_take(TickType_t timeout);
 
 esp_err_t camera_manager_init(void) {
     camera_config_t config = {
@@ -309,12 +314,13 @@ esp_err_t camera_manager_capture(httpd_req_t *req) {
     int frames_to_skip = s_discard_next_frame ? 2 : 1;
     s_discard_next_frame = false;
 
+    const TickType_t frame_timeout = pdMS_TO_TICKS(CAMERA_MANAGER_CAPTURE_TIMEOUT_MS);
     camera_fb_t *frame = NULL;
     for (int attempt = 0; attempt < 4; ++attempt) {
-        frame = esp_camera_fb_get();
+        frame = camera_manager_fb_get_with_timeout(frame_timeout);
         if (!frame) {
-            ESP_LOGE(CAMERA_MANAGER_TAG, "Failed to acquire camera frame");
-            camera_manager_set_error(ESP_FAIL, "Unable to capture an image. Ensure the camera module is seated correctly and sufficient lighting/power is available, then try again.");
+            ESP_LOGE(CAMERA_MANAGER_TAG, "Failed to acquire camera frame within %d ms", CAMERA_MANAGER_CAPTURE_TIMEOUT_MS);
+            camera_manager_set_error(ESP_ERR_TIMEOUT, "Image capture timed out. Ensure the camera module is seated correctly, sufficient lighting/power is available, and try again.");
             if (flash_active) {
                 camera_flash_set(false);
             }
@@ -373,6 +379,29 @@ esp_err_t camera_manager_capture(httpd_req_t *req) {
         camera_flash_set(false);
     }
     return res;
+}
+
+static camera_fb_t *camera_manager_fb_get_with_timeout(TickType_t timeout_ticks) {
+    if (timeout_ticks == 0) {
+        timeout_ticks = 1;
+    }
+
+    camera_fb_t *fb = cam_take(timeout_ticks);
+    if (!fb) {
+        return NULL;
+    }
+
+    sensor_t *sensor = esp_camera_sensor_get();
+    if (sensor) {
+        framesize_t active = sensor->status.framesize;
+        if (active >= FRAMESIZE_96X96 && active < FRAMESIZE_INVALID) {
+            fb->width = resolution[active].width;
+            fb->height = resolution[active].height;
+        }
+        fb->format = sensor->pixformat;
+    }
+
+    return fb;
 }
 
 static sensor_t *camera_manager_sensor(void) {

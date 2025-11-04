@@ -1598,6 +1598,8 @@ esp_err_t http_server_app_start(void) {
     config.stack_size = 10240;
     config.server_port = 80;
     config.uri_match_fn = httpd_uri_match_wildcard;
+    config.recv_wait_timeout = 15;
+    config.send_wait_timeout = 15;
 
     esp_err_t err = httpd_start(&s_http_handle, &config);
     if (err != ESP_OK) {
