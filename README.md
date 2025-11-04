@@ -1,0 +1,208 @@
+# WifiCamera Firmware
+
+WifiCamera is an ESP-IDF based firmware for ESP32-CAM class boards that turns the device into a Wi-Fi enabled camera with a web dashboard, on-device provisioning flow, REST-style APIs and fine grained runtime control of camera and flash parameters.
+
+---
+
+## Features
+
+- **Zero-touch provisioning** – captive portal style web UI for scanning Wi-Fi networks, saving credentials and monitoring connection progress.
+- **Streaming-ready JPEG capture** – optimized single-shot JPEG images with on-demand capture via web UI or HTTP APIs.
+- **Robust camera configuration** – fallback to DRAM frame buffers when PSRAM is unavailable, dynamic resolution and quality adjustments, real-time sensor control, and optional PWM-based flashlight brightness.
+- **REST APIs** – capture and device status endpoints for remote integration (home automation, cloud services, testing frameworks, etc.).
+- **Resilient Wi-Fi management** – persistent credential storage, retry logic with automatic AP fallback for provisioning, and diagnostic metrics (RSSI, disconnect reasons).
+
+---
+
+## Getting Started
+
+### Requirements
+
+- ESP32-CAM (ESP32 SoC with integrated camera module).
+- ESP-IDF v5.2.x toolchain (already referenced in the repo via `cmake` and `idf.py` helpers).
+- Python 3.8+ (for ESP-IDF tools) and `cmake`.
+
+### Build
+
+```bash
+cmake -S . -B build
+cmake --build build
+```
+
+### Flash & Monitor
+
+```bash
+idf.py -p <PORT> flash monitor
+```
+
+> Replace `<PORT>` with your serial device (for example `/dev/ttyUSB0` or `COM6`).
+
+---
+
+## Provisioning & Web Dashboard
+
+1. **First boot** – the device starts in provisioning mode, broadcasting its AP (e.g. `WifiCamera-XXXX`).
+2. **Connect & configure** – join the AP and navigate to `http://192.168.4.1`. The provisioning page allows scanning for local networks and saving credentials.
+3. **Dashboard** – once credentials are saved the device automatically switches to station mode. Point your browser to the assigned IP to access the dashboard:
+   - Capture photos interactively.
+   - Adjust resolution, quality, sensor controls, and flashlight.
+   - View diagnostics such as connection status, camera readiness, and last capture metadata.
+
+---
+
+## Use Cases
+
+- **Home / office monitoring** – integrate with automation workflows using scripted capture requests.
+- **Embedded QA testing** – capture images during manufacturing, calibrate camera modules, or run regression suites against camera modes.
+- **IoT prototyping** – combine with motion sensors or webhooks to build lightweight security or time-lapse systems.
+- **Educational labs** – explore ESP32 peripherals (camera, PWM, Wi-Fi) in a single project with a friendly UI and API.
+
+---
+
+## API Reference
+
+All endpoints are served over HTTP (default port 80). Responses include `Cache-Control: no-store` to ease repeated polling.
+
+### `GET /api/status`
+
+Returns real-time connectivity and camera state used by the dashboard.
+
+```json
+{
+  "connected": true,
+  "mode": "station",
+  "ssid": "MyWiFi",
+  "rssi": -56,
+  "ip": "192.168.1.42",
+  "restart_in_ms": 0,
+  "restart_pending": false,
+  "factory_reset_pending": false,
+  "camera_ready": true,
+  "camera_initialized": true,
+  "camera_error_code": 0,
+  "camera_message": "Camera ready. Flashlight enabled (60% brightness).",
+  "camera_low_mem": false,
+  "camera_framesize": 11,
+  "camera_frame_width": 800,
+  "camera_frame_height": 600,
+  "camera_flash_supported": true,
+  "camera_flash_enabled": true,
+  "camera_flash_brightness": 60,
+  "sta_connecting": false,
+  "sta_retry_count": 0,
+  "sta_reason": 0,
+  "sta_reason_message": ""
+}
+```
+
+### `GET /api/device/status`
+
+Summarised device metrics for integrations that only need key health data.
+
+```json
+{
+  "ssid": "MyWiFi",
+  "connected": true,
+  "rssi": -56,
+  "uptime_seconds": 12345,
+  "storage_total": 1048576,
+  "storage_free": 786432
+}
+```
+
+`storage_*` fields return `-1` if the underlying platform does not expose filesystem statistics.
+
+### `GET /api/capture`
+
+Performs a capture using the current persisted configuration (as set by the dashboard or `/api/control`). Success yields a JPEG binary response (`Content-Type: image/jpeg`). Typical use:
+
+```bash
+curl -o latest.jpg http://<IP>/api/capture
+```
+
+### `GET /api/capture/config`
+
+Performs a capture with optional **temporary** overrides passed as query parameters. After the shot completes all settings revert to their previous values.
+
+The response is the JPEG image (`HTTP 200`). Validation failures return:
+
+- `400 Bad Request` – invalid value or unsupported parameter name.
+- `501 Not Implemented` – feature not supported by the hardware (e.g., attempting to set `flash_brightness` when PWM is unavailable).
+
+#### Supported Query Parameters
+
+| Parameter          | Type / Range              | Description                                                    |
+|--------------------|---------------------------|----------------------------------------------------------------|
+| `resolution` or `framesize` | enum (case-insensitive): `QVGA`, `VGA`, `SVGA`, `XGA`, `UXGA`, etc. | Maps to ESP32 camera frame sizes; see table below.             |
+| `quality`          | int 10–63                 | JPEG quality (lower = higher quality).                         |
+| `brightness`       | int -2 – 2                | Sensor brightness offset.                                      |
+| `contrast`         | int -2 – 2                | Sensor contrast adjustment.                                    |
+| `saturation`       | int -2 – 2                | Sensor color saturation.                                       |
+| `sharpness`        | int -2 – 2                | Sensor edge sharpness.                                         |
+| `special_effect`   | int 0 – 6                 | Sensor special effects (0 = none).                             |
+| `awb`              | boolean (0/1)             | Auto white balance.                                            |
+| `aec`              | boolean (0/1)             | Auto exposure control.                                         |
+| `agc`              | boolean (0/1)             | Auto gain control.                                             |
+| `hmirror`          | boolean (0/1)             | Horizontal mirror.                                             |
+| `vflip`            | boolean (0/1)             | Vertical flip.                                                 |
+| `flash`            | boolean (0/1)             | Enable or disable torch for this capture.                      |
+| `flash_brightness` | int 0 – 100               | Torch brightness percentage (PWM-supported hardware only).     |
+| `ts`               | string                    | Optional cache-busting token (ignored by firmware).           |
+
+**Resolution keywords** (abbreviated list):
+
+```
+96X96, QQVGA, 128X128, QCIF, HQVGA, 240X240,
+QVGA, 320X320, CIF, HVGA, VGA, SVGA, XGA,
+HD, SXGA, UXGA, FHD, P_HD, P_3MP, QXGA,
+QHD, WQXGA, P_FHD, QSXGA, 5MP
+```
+
+Example:
+
+```bash
+curl -o capture.jpg \
+  "http://<IP>/api/capture/config?resolution=VGA&quality=12&flash=1&flash_brightness=60"
+```
+
+### `GET /api/control`
+
+Persistently updates a single camera control. Accepts the same parameters as the capture endpoint but **only one per request**. Primary use cases include remote reconfiguration scripts.
+
+```bash
+curl "http://<IP>/api/control?var=framesize&val=11"   # set SVGA
+curl "http://<IP>/api/control?var=flash&val=1"
+```
+
+Returns `{"status":"ok"}` on success or `400` on failure.
+
+### `POST /api/factory_reset`
+
+Schedules a factory reset and reboots the device after a short delay. To reduce accidental resets, the request must include a confirmation token in the query string:
+
+```bash
+curl -X POST "http://<IP>/api/factory_reset?confirm=factory_reset"
+```
+
+If the `confirm` token is missing or incorrect, the endpoint responds with `400` and `{"error":"confirm_token_required"}`.
+
+---
+
+## Flashlight Brightness Support
+
+- When LEDC PWM is available, `flash=1` can be combined with `flash_brightness` (0–100%). The firmware auto-detects support at runtime.
+- On hardware without PWM support, the flashlight behaves as a binary on/off torch. Brightness commands are ignored (HTTP `501`) and the status endpoints flag the limitation.
+
+---
+
+## Development Notes
+
+- The firmware detects missing PSRAM, automatically reduces resolution and quality, and stores snapshots in DRAM to prevent boot loops.
+- Temporary capture overrides always roll back to prior values, ensuring dashboard settings remain consistent.
+- Filesystem statistics (`storage_total`, `storage_free`) are reported as `-1` when the platform lacks `statvfs`.
+
+---
+
+## License
+
+This project extends ESP-IDF components and the ESP32 camera driver. Refer to each component’s LICENSE file for terms and distribution requirements.

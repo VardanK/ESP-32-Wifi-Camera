@@ -1,0 +1,31 @@
+#!/bin/sh
+set -e
+
+IDF_PATH="@ESP_IDF_PATH@"
+TOOLCHAIN_BIN="@ESP_IDF_TOOLCHAIN_BIN@"
+PYTHON_BIN="@ESP_IDF_PYTHON@"
+REAL_MAKE="@ESP_IDF_REAL_MAKE@"
+
+if [ -n "$IDF_PATH" ]; then
+    export IDF_PATH="$IDF_PATH"
+fi
+
+if [ -n "$TOOLCHAIN_BIN" ] && [ -d "$TOOLCHAIN_BIN" ]; then
+    case ":$PATH:" in
+        *":$TOOLCHAIN_BIN:"*) ;;
+        *) PATH="$TOOLCHAIN_BIN:$PATH";;
+    esac
+    export PATH
+    if [ -x "$TOOLCHAIN_BIN/xtensa-esp32-elf-gcc" ]; then
+        export CC="$TOOLCHAIN_BIN/xtensa-esp32-elf-gcc"
+    fi
+    if [ -x "$TOOLCHAIN_BIN/xtensa-esp32-elf-g++" ]; then
+        export CXX="$TOOLCHAIN_BIN/xtensa-esp32-elf-g++"
+    fi
+fi
+
+if [ -n "$PYTHON_BIN" ]; then
+    export PYTHON="$PYTHON_BIN"
+fi
+
+exec "$REAL_MAKE" "$@"
