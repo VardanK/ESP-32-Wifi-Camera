@@ -944,6 +944,14 @@ static esp_err_t handle_config(httpd_req_t *req) {
     return httpd_resp_send(req, "{\"status\":\"ok\"}", HTTPD_RESP_USE_STRLEN);
 }
 
+/**
+ * Build and send a JSON status payload describing network connectivity, restart/factory-reset timers,
+ * and camera state (initialization, readiness, error code/message, framesize/dimensions, flash state),
+ * plus STA connection diagnostics.
+ *
+ * @param req HTTP request handle used to write headers and the JSON response body.
+ * @returns ESP_OK if the response was sent successfully; otherwise an error code returned by the HTTP server API. 
+ */
 static esp_err_t handle_status(httpd_req_t *req) {
     bool connected = wifi_manager_is_connected();
     bool provisioning = wifi_manager_is_provisioning();
@@ -1589,6 +1597,16 @@ static void url_decode(char *str) {
     *dst = '\0';
 }
 
+/**
+ * Start the HTTP server and register built-in API endpoints if the server is not already running.
+ *
+ * This function initializes the HTTP server with the configured parameters, registers the
+ * application's URI handlers (root, scan, config, status, device status, capture, control,
+ * and factory reset), and ensures the restart countdown timer is created. The call is
+ * idempotent: if the server is already started, it returns immediately.
+ *
+ * @returns ESP_OK on success, or an esp_err_t error code if the server fails to start. 
+ */
 esp_err_t http_server_app_start(void) {
     if (s_http_handle) {
         return ESP_OK;
